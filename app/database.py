@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS cues (
     start_sec       REAL NOT NULL,
     end_sec         REAL NOT NULL,
     text            TEXT NOT NULL,
-    source_indices  TEXT NOT NULL DEFAULT '[]'
+    source_indices  TEXT NOT NULL DEFAULT '[]',
+    language        TEXT NOT NULL DEFAULT 'unknown'
 );
 
 CREATE TABLE IF NOT EXISTS issues (
@@ -91,6 +92,23 @@ def init_db(path: str | None = None) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
     with get_conn(target) as conn:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """为旧版数据库补齐后加的列；既有 cue 的语言按文本即时检测回填。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(cues)")}
+    if "language" not in cols:
+        conn.execute(
+            "ALTER TABLE cues ADD COLUMN language TEXT NOT NULL DEFAULT 'unknown'"
+        )
+        rows = conn.execute("SELECT id, text FROM cues").fetchall()
+        if rows:
+            from .subtitles import detect_language
+            conn.executemany(
+                "UPDATE cues SET language = ? WHERE id = ?",
+                [(detect_language(r["text"]), r["id"]) for r in rows],
+            )
 
 
 @contextmanager
@@ -121,11 +139,13 @@ def save_submission(filename: str, fmt: str, max_chars: int, min_dwell: float,
 
         conn.executemany(
             """INSERT INTO cues
-               (submission_id, seq, start_sec, end_sec, text, source_indices)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               (submission_id, seq, start_sec, end_sec, text, source_indices,
+                language)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             [(sid, i, c.start, c.end, c.text,
-              json.dumps(spans, ensure_ascii=False))
-             for i, (c, spans) in enumerate(zip(result.cues, result.spans))],
+              json.dumps(spans, ensure_ascii=False), lang)
+             for i, (c, spans, lang) in enumerate(
+                 zip(result.cues, result.spans, result.cue_languages))],
         )
         conn.executemany(
             """INSERT INTO issues
@@ -166,7 +186,7 @@ def get_artifact(submission_id: int) -> dict | None:
             (submission_id,),
         ).fetchone()
         cues = conn.execute(
-            """SELECT seq, start_sec, end_sec, text, source_indices
+            """SELECT seq, start_sec, end_sec, text, source_indices, language
                FROM cues WHERE submission_id = ? ORDER BY seq""",
             (submission_id,),
         ).fetchall()

@@ -15,6 +15,7 @@ os.environ.setdefault("DB_PATH", os.path.join(tempfile.mkdtemp(), "test.db"))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
+from app.subtitles import format_timestamp  # noqa: E402
 
 VTT = (
     "WEBVTT\n\n"
@@ -26,6 +27,29 @@ SRT = (
     "This is the longest sentence and you will not have time\n\n"
     "2\n00:00:01,200 --> 00:00:01,400\n另一句中文也同样非常拥挤根本读不完呢\n"
 )
+
+
+def _has_cjk(text: str) -> bool:
+    return any("一" <= ch <= "鿿" for ch in text)
+
+
+def _parse_vtt_blocks(vtt: str):
+    """把导出的 WebVTT 拆成 (NOTE 行列表, 时间码, 文本) 形式的 cue 块。"""
+    assert vtt.startswith("WEBVTT")
+    blocks, pending_notes = [], []
+    for block in vtt.rstrip("\n").split("\n\n")[1:]:
+        lines = block.split("\n")
+        if lines[0].startswith("NOTE"):
+            pending_notes.append(lines[0][len("NOTE "):])
+            continue
+        timing = next((ln for ln in lines if "-->" in ln), None)
+        assert timing is not None, f"非 NOTE 块缺少时间码：{block!r}"
+        start, end = [t.strip() for t in timing.split("-->")]
+        text = "\n".join(ln for ln in lines if ln != timing)
+        blocks.append((pending_notes, start, end, text))
+        pending_notes = []
+    assert not pending_notes, "存在未附着到 cue 的尾部 NOTE"
+    return blocks
 
 
 def main() -> None:
@@ -85,6 +109,70 @@ def main() -> None:
         assert export.status_code == 200
         assert export.text.startswith("WEBVTT\n")
         assert export.text.count("-->") == len(data["cues"])
+
+        # --- 导出接口 language 参数回归 ---
+        # 中文 cue 时间过紧会产生问题；英文 cue 时长充足且不会被切分
+        mixed_vtt = (
+            "WEBVTT\n\n"
+            "00:00:01.000 --> 00:00:01.200\n这是一个非常非常长的句子根本来不及读完\n\n"
+            "00:00:01.200 --> 00:00:01.400\n后面紧接着另一句内容也是超长的呢\n\n"
+            "00:00:03.000 --> 00:00:07.000\nThis is a calm English cue with enough time.\n"
+        )
+        mx = client.post(
+            "/api/analyze",
+            files={"file": ("mixed.vtt", mixed_vtt, "text/vtt")},
+            data={"max_chars": "50", "min_dwell": "0.8", "max_cps": "12"},
+        ).json()
+        mxid = mx["id"]
+
+        # 未选择语言：完整导出，与分析时持久化的修订 VTT 一致
+        full = client.get(f"/api/submissions/{mxid}/export")
+        assert full.text.count("-->") == len(mx["cues"])
+        zh_cues = [c for c in mx["cues"] if _has_cjk(c["text"])]
+        en_cues = [c for c in mx["cues"] if not _has_cjk(c["text"])]
+        zh_issues = [i for i in mx["issues"] if i["language"] == "zh"]
+        en_issues = [i for i in mx["issues"] if i["language"] == "en"]
+        assert zh_cues and en_cues and zh_issues and not en_issues
+
+        # 选择中文：只输出中文修订 cue，保持顺序、时间码与文本，
+        # 且仅重建这些 cue 对应的 NOTE 标注
+        zh_resp = client.get(f"/api/submissions/{mxid}/export?language=zh")
+        assert zh_resp.status_code == 200
+        assert "attachment" in zh_resp.headers["content-disposition"]
+        zh_blocks = _parse_vtt_blocks(zh_resp.text)
+        assert len(zh_blocks) == len(zh_cues)
+        for block, cue in zip(zh_blocks, zh_cues):
+            notes, start, end, text = block
+            assert _has_cjk(text)
+            assert text == cue["text"]
+            assert start == format_timestamp(cue["start"])
+            assert end == format_timestamp(cue["end"])
+        note_count = sum(len(b[0]) for b in zh_blocks)
+        assert note_count == len(zh_issues)
+        for notes, _start, _end, text in zh_blocks:
+            for note in notes:
+                assert note.startswith("[校验问题/")
+                assert text in {i["segment"] for i in zh_issues}
+        # 顺序与时间码单调不减，文本中不混入英文 cue
+        starts = [b[1] for b in zh_blocks]
+        assert starts == sorted(starts)
+        assert all("calm english" not in b[3].lower() for b in zh_blocks)
+
+        # 选择英语：无问题 cue 也应原样导出，且没有任何 NOTE 标注
+        en_resp = client.get(f"/api/submissions/{mxid}/export?language=en")
+        en_blocks = _parse_vtt_blocks(en_resp.text)
+        assert len(en_blocks) == len(en_cues)
+        assert sum(len(b[0]) for b in en_blocks) == 0
+        assert en_blocks[0][3] == "This is a calm English cue with enough time."
+        assert en_blocks[0][1] == format_timestamp(en_cues[0]["start"])
+        assert en_blocks[0][2] == format_timestamp(en_cues[0]["end"])
+
+        # 选择无匹配 cue 的语言：仍返回结构有效的空 WebVTT
+        fr_resp = client.get(f"/api/submissions/{mxid}/export?language=fr")
+        assert fr_resp.status_code == 200
+        fr_blocks = _parse_vtt_blocks(fr_resp.text)
+        assert fr_blocks == []
+        assert fr_resp.text.strip() == "WEBVTT"
 
         # --- 术语审校 ---
         # 1. 维护按语言区分的术语表

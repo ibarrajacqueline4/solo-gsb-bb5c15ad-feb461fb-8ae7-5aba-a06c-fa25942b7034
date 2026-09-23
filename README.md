@@ -47,7 +47,10 @@ SQLite 数据库文件位于容器内 `/data/subtitles.db`，通过 Compose 命�
 - **按语言筛选问题**：基于文字系统（中/日/韩/拉丁）与常用词的启发式语言
   检测，可在结果页下拉过滤；可勾选「只看有问题的条目」。
 - **导出修订 WebVTT**：修订后的 cue 导出为标准 `.vtt`，问题原因以
-  `NOTE` 行内嵌，可直接用于后续校对。
+  `NOTE` 行内嵌，可直接用于后续校对；在结果页选择语言后导出（或追加
+  `?language=xx`），仅输出检测语言匹配的修订 cue（保持原顺序、时间码与
+  文本，仅保留这些 cue 的 `NOTE`），无匹配 cue 时仍返回结构有效的空
+  WebVTT；未选择语言时导出全部修订 cue。
 - **历史任务**：每次校验存入 SQLite，可重新查看或再次导出。
 
 ## 术语审校
@@ -109,7 +112,7 @@ SQLite 数据库文件位于容器内 `/data/subtitles.db`，通过 Compose 命�
 | POST | `/api/analyze` | multipart 上传 `file`、`max_chars`、`min_dwell`、`max_cps`（响应含 `term_findings` 术语疑似项数） |
 | GET  | `/api/submissions` | 历史任务列表 |
 | GET  | `/api/submissions/{id}` | 单次任务完整结果（支持 `?language=en` 过滤） |
-| GET  | `/api/submissions/{id}/export` | 下载修订后的 WebVTT |
+| GET  | `/api/submissions/{id}/export` | 下载修订后的 WebVTT（支持 `?language=en`：仅导出该检测语言的修订 cue 及其校验 NOTE） |
 | GET  | `/api/terms` | 术语表列表（支持 `?language=zh` 过滤，通用术语一并返回） |
 | POST | `/api/terms` | 新增术语（JSON：`language`/`canonical`/`variants`/`forbidden`/`note`） |
 | PUT  | `/api/terms/{id}` | 更新术语 |

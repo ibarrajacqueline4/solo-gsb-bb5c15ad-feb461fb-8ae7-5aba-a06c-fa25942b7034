@@ -76,6 +76,15 @@ def _result_payload(sid: int, filename: str, fmt: str, params: dict,
     }
 
 
+def _build_notes(issues) -> dict[int, list[str]]:
+    """按修订 cue 序号汇总校验问题，生成 write_vtt 需要的 NOTE 标注。"""
+    notes: dict[int, list[str]] = {}
+    for iss in sorted(issues, key=lambda i: i["cue_seq"]):
+        notes.setdefault(iss["cue_seq"], []).append(
+            f"[校验问题/{iss['kind']}] {iss['reason']}")
+    return notes
+
+
 @app.post("/api/analyze")
 async def api_analyze(
     file: UploadFile = File(...),
@@ -105,13 +114,10 @@ async def api_analyze(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    notes = {}
-    flagged = {iss.index for iss in result.issues}
-    for seq in sorted(flagged):
-        for iss in result.issues:
-            if iss.index == seq:
-                notes.setdefault(seq, []).append(
-                    f"[校验问题/{iss.kind}] {iss.reason}")
+    notes = _build_notes([
+        {"cue_seq": iss.index, "kind": iss.kind, "reason": iss.reason}
+        for iss in result.issues
+    ])
     revised_vtt = write_vtt(result.cues, notes=notes)
     sid = db.save_submission(name, fmt, max_chars, min_dwell, max_cps,
                              result, revised_vtt)
@@ -199,9 +205,26 @@ async def api_export(sid: int, language: str | None = None):
     record = db.get_artifact(sid)
     if record is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    vtt = record["revised_vtt"]
+
     base = record["submission"]["filename"].rsplit(".", 1)[0]
     filename = f"{base}.revised.vtt"
+
+    if not language:
+        # 未选择语言：导出完整修订 WebVTT（沿用分析时持久化的内容）
+        vtt = record["revised_vtt"]
+    else:
+        # 结果页选择了语言：只输出检测语言匹配的修订 cue，保持原顺序、
+        # 时间码与文本，并仅重建这些 cue 对应的校验 NOTE 标注
+        cue_rows = [c for c in record["cues"] if c["language"] == language]
+        cues = [Cue(start=c["start_sec"], end=c["end_sec"], text=c["text"])
+                for c in cue_rows]
+        all_notes = _build_notes(record["issues"])
+        notes = {
+            pos: all_notes.get(c["seq"], [])
+            for pos, c in enumerate(cue_rows)
+        }
+        vtt = write_vtt(cues, notes=notes)
+
     return Response(
         content=vtt,
         media_type="text/vtt; charset=utf-8",

@@ -62,6 +62,8 @@ class Result:
     stats: dict
     # 每个修订 cue 跨越的原 cue 序号（0 基）
     spans: list[list[int]] = field(default_factory=list)
+    # 每个修订 cue 的检测语言（按来源原 cue 语言多数决，与 issue 语言同口径）
+    cue_languages: list[str] = field(default_factory=list)
 
 
 def _is_no_space(ch: str) -> bool:
@@ -308,13 +310,16 @@ def analyze(cues: list[Cue], max_chars: int, min_dwell: float,
 
     # 6. 生成问题报告（最少违例区段解释）
     issues: list[Issue] = []
+    revised_languages: list[str] = []
     for idx, cue in enumerate(revised):
         src = spans[idx]
         length = len(cue.text)
         dur = cue.duration
         cps = length / dur if dur > 0 else float("inf")
         src_langs = [cue_langs[s] for s in src]
+        # 语言按来源原 cue 多数决：切分后的短片段也继承来源 cue 的语言
         lang = max(set(src_langs), key=src_langs.count)
+        revised_languages.append(lang)
 
         # 该段跨原 cue（合并）或与跨 cue 段相邻时，
         # 说明 DP 已经探索过跨 cue 借调时间的可能
@@ -378,4 +383,5 @@ def analyze(cues: list[Cue], max_chars: int, min_dwell: float,
         "moved_boundaries": moved,
         "languages": sorted({i.language for i in issues}),
     }
-    return Result(cues=revised, issues=issues, stats=stats, spans=spans)
+    return Result(cues=revised, issues=issues, stats=stats, spans=spans,
+                  cue_languages=revised_languages)

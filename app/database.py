@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS cues (
     start_sec       REAL NOT NULL,
     end_sec         REAL NOT NULL,
     text            TEXT NOT NULL,
-    source_indices  TEXT NOT NULL DEFAULT '[]'
+    source_indices  TEXT NOT NULL DEFAULT '[]',
+    language        TEXT NOT NULL DEFAULT 'unknown'
 );
 
 CREATE TABLE IF NOT EXISTS issues (
@@ -91,6 +92,12 @@ def init_db(path: str | None = None) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
     with get_conn(target) as conn:
         conn.executescript(_SCHEMA)
+        # 旧库迁移：为已存在的 cues 表补齐修订 cue 检测语言列
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(cues)")}
+        if "language" not in cols:
+            conn.execute(
+                "ALTER TABLE cues ADD COLUMN language TEXT NOT NULL "
+                "DEFAULT 'unknown'")
 
 
 @contextmanager
@@ -119,13 +126,18 @@ def save_submission(filename: str, fmt: str, max_chars: int, min_dwell: float,
         )
         sid = cur.lastrowid
 
+        cue_languages = (result.cue_languages
+                         if len(result.cue_languages) == len(result.cues)
+                         else ["unknown"] * len(result.cues))
         conn.executemany(
             """INSERT INTO cues
-               (submission_id, seq, start_sec, end_sec, text, source_indices)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               (submission_id, seq, start_sec, end_sec, text, source_indices,
+                language)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             [(sid, i, c.start, c.end, c.text,
-              json.dumps(spans, ensure_ascii=False))
-             for i, (c, spans) in enumerate(zip(result.cues, result.spans))],
+              json.dumps(spans, ensure_ascii=False), lang)
+             for i, (c, spans, lang) in enumerate(
+                 zip(result.cues, result.spans, cue_languages))],
         )
         conn.executemany(
             """INSERT INTO issues
@@ -166,7 +178,7 @@ def get_artifact(submission_id: int) -> dict | None:
             (submission_id,),
         ).fetchone()
         cues = conn.execute(
-            """SELECT seq, start_sec, end_sec, text, source_indices
+            """SELECT seq, start_sec, end_sec, text, source_indices, language
                FROM cues WHERE submission_id = ? ORDER BY seq""",
             (submission_id,),
         ).fetchall()

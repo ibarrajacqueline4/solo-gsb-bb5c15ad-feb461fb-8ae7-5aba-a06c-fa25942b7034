@@ -15,6 +15,7 @@ os.environ.setdefault("DB_PATH", os.path.join(tempfile.mkdtemp(), "test.db"))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
+from app.subtitles import parse_subtitle  # noqa: E402
 
 VTT = (
     "WEBVTT\n\n"
@@ -85,6 +86,85 @@ def main() -> None:
         assert export.status_code == 200
         assert export.text.startswith("WEBVTT\n")
         assert export.text.count("-->") == len(data["cues"])
+        # 未选择语言：完整导出，校验 NOTE 全部保留
+        assert export.text.count("NOTE ") == len(data["issues"])
+
+        # 按语言导出（纯中文任务）：全部 cue 命中；无匹配语言返回结构有效的空 VTT
+        zh_only = client.get(f"/api/submissions/{sid}/export?language=zh")
+        assert zh_only.status_code == 200
+        zh_cues = parse_subtitle(zh_only.text)
+        assert len(zh_cues) == len(data["cues"])
+        assert [c.text for c in zh_cues] == [c["text"] for c in data["cues"]]
+        # 时间码原样保留（三位毫秒精度）
+        assert all(
+            abs(a.start - b["start"]) < 5e-4
+            and abs(a.end - b["end"]) < 5e-4
+            for a, b in zip(zh_cues, data["cues"]))
+        # 校验 NOTE 随对应 cue 一起重建
+        assert zh_only.text.count("NOTE ") == len(data["issues"])
+
+        def is_empty_vtt(text: str) -> bool:
+            return (text.startswith("WEBVTT\n") and "-->" not in text
+                    and "NOTE " not in text)
+
+        none_lang = client.get(
+            f"/api/submissions/{sid}/export?language=en")
+        assert none_lang.status_code == 200
+        assert is_empty_vtt(none_lang.text)
+        bogus_lang = client.get(
+            f"/api/submissions/{sid}/export?language=klingon")
+        assert bogus_lang.status_code == 200
+        assert is_empty_vtt(bogus_lang.text)
+        assert client.get(
+            "/api/submissions/9999/export?language=zh").status_code == 404
+
+        # 混合语言任务：选择语言后只输出检测语言匹配的修订 cue，顺序不变
+        mixed_detail = client.get(
+            f"/api/submissions/{mixed['id']}").json()
+        en_seqs = [c["seq"] for c in mixed_detail["cues"]
+                   if c["language"] == "en"]
+        zh_seqs = [c["seq"] for c in mixed_detail["cues"]
+                   if c["language"] == "zh"]
+        assert en_seqs and zh_seqs  # 两种语言的修订 cue 都存在
+        by_seq = {c["seq"]: c for c in mixed_detail["cues"]}
+
+        en_export = client.get(
+            f"/api/submissions/{mixed['id']}/export?language=en")
+        assert en_export.status_code == 200
+        en_out = parse_subtitle(en_export.text)
+        assert len(en_out) == len(en_seqs)
+        assert [c.text for c in en_out] == [by_seq[s]["text"] for s in en_seqs]
+        assert [round(c.start, 3) for c in en_out] == [
+            round(by_seq[s]["start"], 3) for s in en_seqs]
+        # 短片段 'longest' 自身检测为 other，但继承来源英文 cue 的检测语言
+        assert any(c.text == "longest" for c in en_out)
+        # 中文 cue 不混入英文导出
+        assert not any(any("一" <= ch <= "鿿" for ch in c.text)
+                       for c in en_out)
+        # NOTE 只为导出的英文 cue 重建（英文 issue 全部在这些 cue 上）
+        en_issue_n = sum(
+            1 for i in mixed_detail["issues"]
+            if i["language"] == "en" and i["cue_seq"] in en_seqs)
+        assert en_export.text.count("NOTE ") == en_issue_n
+        assert "Content-Disposition" in en_export.headers
+        assert 'filename="demo.revised.en.vtt"' in \
+            en_export.headers["Content-Disposition"]
+
+        zh_export = client.get(
+            f"/api/submissions/{mixed['id']}/export?language=zh")
+        zh_out = parse_subtitle(zh_export.text)
+        assert [c.text for c in zh_out] == [by_seq[s]["text"] for s in zh_seqs]
+        assert all(any("一" <= ch <= "鿿" for ch in c.text)
+                   for c in zh_out)
+
+        # 不选语言：完整导出，cue 总数为两种语言之和，内容一致
+        full_export = client.get(f"/api/submissions/{mixed['id']}/export")
+        full_out = parse_subtitle(full_export.text)
+        assert len(full_out) == len(en_seqs) + len(zh_seqs)
+        assert [c.text for c in full_out] == [
+            c["text"] for c in mixed_detail["cues"]]
+        assert "NOTE " not in full_export.text or \
+            full_export.text.count("NOTE ") == len(mixed_detail["issues"])
 
         # --- 术语审校 ---
         # 1. 维护按语言区分的术语表

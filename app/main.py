@@ -66,6 +66,8 @@ def _result_payload(sid: int, filename: str, fmt: str, params: dict,
                 "cps": round(len(c.text) / c.duration, 1)
                 if c.duration > 0 else None,
                 "text": c.text,
+                "language": (result.cue_languages[i]
+                             if i < len(result.cue_languages) else "unknown"),
                 "sources": [s + 1 for s in spans],
                 "redistributed": len(spans) > 1,
             }
@@ -168,6 +170,7 @@ async def api_get_submission(sid: int, language: str | None = None):
                 "cps": round(len(c["text"])
                              / max(1e-9, c["end_sec"] - c["start_sec"]), 1),
                 "text": c["text"],
+                "language": c.get("language", "unknown"),
                 "sources": [s + 1 for s in json.loads(c["source_indices"])],
                 "redistributed": len(json.loads(c["source_indices"])) > 1,
             }
@@ -199,9 +202,28 @@ async def api_export(sid: int, language: str | None = None):
     record = db.get_artifact(sid)
     if record is None:
         raise HTTPException(status_code=404, detail="记录不存在")
-    vtt = record["revised_vtt"]
+
+    if not language:
+        # 未选择语言：保持完整导出（沿用分析时落库的原文）
+        vtt = record["revised_vtt"]
+    else:
+        # 按检测语言筛选修订 cue，保持原顺序、时间码与文本；
+        # 仅为保留下来的 cue 重建该语言的校验 NOTE 标注
+        cue_rows = [c for c in record["cues"]
+                    if c.get("language", "unknown") == language]
+        notes: dict[int, list[str]] = {}
+        for new_idx, c in enumerate(cue_rows):
+            for iss in record["issues"]:
+                if iss["cue_seq"] == c["seq"] and iss["language"] == language:
+                    notes.setdefault(new_idx, []).append(
+                        f"[校验问题/{iss['kind']}] {iss['reason']}")
+        cues = [Cue(start=c["start_sec"], end=c["end_sec"], text=c["text"])
+                for c in cue_rows]
+        vtt = write_vtt(cues, notes=notes)
+
     base = record["submission"]["filename"].rsplit(".", 1)[0]
-    filename = f"{base}.revised.vtt"
+    suffix = f".{language}" if language else ""
+    filename = f"{base}.revised{suffix}.vtt"
     return Response(
         content=vtt,
         media_type="text/vtt; charset=utf-8",
